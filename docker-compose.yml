@@ -1,0 +1,13 @@
+services:
+  theater-mic:
+    build: .
+    image: theater-mic-frequency:latest
+    container_name: theater-mic-frequency
+    ports:
+      - "${PORT:-8000}:8000"
+    environment:
+      # 首次启动且数据库为空时是否写入演示数据：1=是，0=否
+      SEED_DEMO: "1"
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
