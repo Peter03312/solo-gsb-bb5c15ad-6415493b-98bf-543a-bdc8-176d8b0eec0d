@@ -108,6 +108,19 @@
     <h2>编排结果</h2>
     <div id="solution-area"><p class="hint">尚未编排。录入房间与话筒后点击右上角「开始编排」。</p></div>
   </section>
+
+  <!-- 现场执行核验 -->
+  <section class="panel wide">
+    <div class="verif-head">
+      <h2>现场执行核验</h2>
+      <button id="btn-verif-start" class="btn btn-small" type="button">🔒 从最新方案开启核验</button>
+    </div>
+    <p class="hint" style="margin:4px 0 10px">
+      只能从<strong>最新且未过期</strong>的方案开启；开启瞬间冻结方案分配、话筒属性、房间互扰与可用频点，此后录入变更不影响该次核验。
+    </p>
+    <div id="verif-list" class="verif-list"></div>
+    <div id="verif-detail"></div>
+  </section>
 </main>
 
 <script src="/static/app.js"></script>

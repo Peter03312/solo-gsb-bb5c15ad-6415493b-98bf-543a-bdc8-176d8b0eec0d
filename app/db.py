@@ -59,6 +59,34 @@ CREATE TABLE IF NOT EXISTS assignments (
     mic_name    TEXT NOT NULL,
     freq        INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS verifications (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at    TEXT NOT NULL,
+    solution_id   INTEGER NOT NULL REFERENCES solutions(id),
+    note          TEXT,
+    revision      INTEGER NOT NULL DEFAULT 1,
+    report_json   TEXT
+);
+
+CREATE TABLE IF NOT EXISTS verification_snapshots (
+    verification_id INTEGER PRIMARY KEY
+        REFERENCES verifications(id) ON DELETE CASCADE,
+    payload_json    TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS verification_entries (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    verification_id INTEGER NOT NULL
+        REFERENCES verifications(id) ON DELETE CASCADE,
+    mic_id          INTEGER,
+    mic_name        TEXT NOT NULL,
+    start_min       INTEGER NOT NULL,
+    end_min         INTEGER NOT NULL,
+    freq            INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_verif_entries_vid
+    ON verification_entries(verification_id);
 """
 
 

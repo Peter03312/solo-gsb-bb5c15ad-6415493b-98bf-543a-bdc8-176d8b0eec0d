@@ -25,6 +25,8 @@
    - 两台**锁定话筒**彼此互扰、时段重叠且频点差小于保护间隔。
 6. 任意输入（房间、互扰关系、话筒）被修改后，旧方案自动标记为
    **「已过期」**，页面给出醒目提示，需要重新编排。
+7. **现场执行核验**以某次最新且未过期的方案为冻结基线；上报、修订号与
+   报告规则见文末「现场核验接口调用示例」一节。
 
 ## 一键启动（推荐）
 
@@ -79,16 +81,106 @@ python -m app
      **未获配设备**（每个可用频点与哪些已分配设备冲突）；
    - 失败：红色提示条给出非法设备名称与原因（锁定互冲 / 时段非法等），不产生方案。
 4. 修改任意录入后，结果区出现「已过期」黄条；再次点击「开始编排」得到新方案。
+5. **现场执行核验**：得到最新且未过期的方案后，在页面底部「现场执行核验」
+   面板点击「从最新方案开启核验」（或调用 `POST /api/verifications`），系统
+   会冻结该方案的**分配频点、话筒属性、房间互扰关系与可用频点列表**；此后再
+   修改录入、删除或改名话筒，均不影响这次核验。
+   - 按话筒 **ID** 逐台录入实际开机区间 `[开始,结束)` 与实际频点（分钟为
+     0–1440 的整数；区间可首尾相接，同一话筒不得重叠），提交**完整替代**
+     区间集——本次未出现的话筒视为全程未开机；
+   - 每次提交须携带当前**核验修订号**，旧号一律拒绝（409）且不做任何部分
+     写入；成功后修订号 +1；
+   - 报告按时间列出：实际开机话筒之间**同房间/互扰房间且频差小于双方较大
+     保护间隔**的冲突区间；偏离计划频点/锁定频点/可用列表，以及计划未获配
+     却开机的设备区间；计划启用时段中没有上报覆盖的部分标记为**未知**
+     （不推定正常或冲突）；
+   - 已删除或改名的话筒仍按冻结时的身份（原 ID、原名称）参与核验。
+
+## 现场核验接口调用示例
+
+以下示例基于演示数据（`SEED_DEMO=1`）。时间一律为 **0–1440 的整数分钟**
+（如 1260 = 21:00）。
+
+```bash
+# 1) 先编排，得到一份未过期方案
+curl -s -X POST http://localhost:8000/api/solve
+
+# 2) 从最新且未过期的方案开启核验（冻结方案、话筒属性、互扰、可用频点）
+curl -s -X POST http://localhost:8000/api/verifications \
+  -H 'Content-Type: application/json' \
+  -d '{"note":"9月30日首演场"}'
+# -> {"id":1,"solution_id":1,"revision":1,"ok":true}
+
+# 3) 携修订号提交完整替代区间集（每台话筒一行，区间 [开始,结束,频点]）
+curl -s -X PUT http://localhost:8000/api/verifications/1 \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "revision": 1,
+    "report": [
+      {"mic_id": 1, "intervals": [[1140,1260,600]]},
+      {"mic_id": 2, "intervals": [[1140,1200,625],[1200,1290,610]]},
+      {"mic_id": 6, "intervals": [[1155,1305,570]]}
+    ]
+  }'
+# -> {"ok":true,"id":1,"revision":2,"counts":{"conflict_segments":1,...}}
+# 区间也支持对象写法：{"start_min":1140,"end_min":1200,"freq":625}
+
+# 4) 查看核验与报告（也可在页面底部直接查看）
+curl -s http://localhost:8000/api/verifications/1
+
+# 5) 下一次上报仍为“完整替代”，且必须用返回的最新修订号（2）
+curl -s -X PUT http://localhost:8000/api/verifications/1 \
+  -H 'Content-Type: application/json' \
+  -d '{"revision":2,"report":[{"mic_id":1,"intervals":[[1140,1290,600]]}]}'
+```
+
+拒绝场景（整份提交不生效，HTTP 400/409，响应体 `error` 说明原因）：
+
+- `409` 最新方案不存在或已过期时开启核验；提交携带的修订号不是当前号；
+- `400` 上报了冻结方案之外的未知话筒 ID；区间端点不在 0–1440 或
+  开始 ≥ 结束；频点不是不小于 0 的整数；同一话筒区间互相重叠；
+  JSON 结构不符合约定。
+
+报告响应结构（`GET /api/verifications/{id}` 中的 `report` 字段；首次成功
+提交前为 `null`）：
+
+```json
+{
+  "conflicts": [
+    {"start_min":1200,"end_min":1260,
+     "mic_a_id":1,"mic_a":"主持1号","freq_a":600,
+     "mic_b_id":2,"mic_b":"主持2号","freq_b":610,
+     "guard":25,"freq_diff":10,"room_a":"主舞台","room_b":"主舞台"}
+  ],
+  "deviations": [
+    {"start_min":1200,"end_min":1290,"mic_id":2,"mic":"主持2号",
+     "freq":610,"planned_freq":625,
+     "type":"freq_not_planned","reason":"实际频点偏离计划分配频点"}
+  ],
+  "unknown": [
+    {"start_min":1170,"end_min":1200,"mic_id":5,"mic":"休息5号",
+     "planned_freq":600}
+  ],
+  "counts": {"reported_mics":3,"conflict_segments":1,
+             "deviation_segments":1,"unknown_segments":1}
+}
+```
+
+`deviations[].type` 取值：`freq_not_planned`（偏离计划频点）、
+`freq_not_locked`（锁定话筒偏离锁定频点）、`freq_not_allowed`（不在可用
+列表内）、`unplanned_power`（计划未获配却开机）。同一区间可能同时命中
+多条（如既偏离计划又不在可用列表）。
 
 ## 目录结构
 
 ```
 .
 ├── app/
-│   ├── __init__.py      # Flask 路由：录入、校验、编排、方案持久化
+│   ├── __init__.py      # Flask 路由：录入、校验、编排、方案与核验持久化
 │   ├── __main__.py      # python -m app 入口
 │   ├── db.py            # SQLite 连接、建表、演示数据
-│   └── scheduler.py     # CP-SAT 模型：约束、字典序目标、未获配原因分析
+│   ├── scheduler.py     # CP-SAT 模型：约束、字典序目标、未获配原因分析
+│   └── verification.py  # 核验：快照冻结、修订号校验、冲突/偏离/未知报告
 ├── templates/index.html # 单页界面
 ├── static/              # style.css / app.js（原生前端）
 ├── data/                # SQLite 数据卷（theater.db）
@@ -101,7 +193,7 @@ python -m app
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/api/state` | 全部房间、互扰、话筒与最新方案 |
+| GET | `/api/state` | 全部房间、互扰、话筒、最新方案与核验列表（核验含快照与报告） |
 | POST | `/api/rooms` | 新增房间 `{name}` |
 | DELETE | `/api/rooms/{id}` | 删除空房间（下有话筒时拒绝） |
 | POST | `/api/interference` | 新增互扰对 `{room_a_id, room_b_id}` |
@@ -109,7 +201,12 @@ python -m app
 | POST | `/api/mics` | 新增/编辑话筒（带 `id` 为编辑） |
 | DELETE | `/api/mics/{id}` | 删除话筒 |
 | POST | `/api/solve` | 执行编排（非法/锁定互冲返回 409 与设备明细） |
+| POST | `/api/verifications` | 从最新且未过期的方案开启一次核验，冻结方案与输入 |
+| GET | `/api/verifications` | 全部核验记录（含冻结快照、已上报区间与报告） |
+| GET | `/api/verifications/{id}` | 单次核验详情与报告（不存在返回 404） |
+| PUT | `/api/verifications/{id}` | 携 `revision` 提交完整替代区间集（旧号 409，非法内容 400） |
 | POST | `/api/demo` | 空库时写入演示数据 |
-| POST | `/api/reset` | 清空全部数据 |
+| POST | `/api/reset` | 清空全部数据（含核验记录） |
 
 时段以**分钟**（0–1440）提交，频点与保护间隔均为整数 kHz。
+既有录入、编排与方案查询接口的请求/响应格式保持不变。

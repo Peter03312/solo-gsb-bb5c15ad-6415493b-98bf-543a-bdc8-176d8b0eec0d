@@ -7,7 +7,7 @@ from pathlib import Path
 
 from flask import Flask, jsonify, render_template, request
 
-from . import db, scheduler
+from . import db, scheduler, verification
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 app = Flask(
@@ -170,8 +170,17 @@ def get_state():
                 "unassigned": unassigned,
             }
 
+        verif_rows = conn.execute("""
+            SELECT v.*, vs.payload_json AS snapshot_json
+            FROM verifications v
+            LEFT JOIN verification_snapshots vs
+                   ON vs.verification_id = v.id
+            ORDER BY v.id""").fetchall()
+        verifications = [_verification_json(conn, r) for r in verif_rows]
+
         return jsonify(rooms=rooms, interference=interference,
-                       mics=mics, solution=solution)
+                       mics=mics, solution=solution,
+                       verifications=verifications)
     finally:
         conn.close()
 
@@ -378,6 +387,169 @@ def run_solve():
         conn.close()
 
 
+# ---------------------------------------------------------------- 现场核验
+
+def _load_snapshot_inputs(conn, sol_row):
+    """按方案冻结时刻重建核验快照所需的全部输入。
+
+    快照直接使用方案自身的分配结果；话筒属性 / 房间 / 互扰读取当前表，
+    因此「开启核验」必须以最新且未过期的方案为前提，开启后再被修改也
+    不会影响已冻结的快照。
+    """
+    sol_id = sol_row["id"]
+    rooms = [dict(r) for r in conn.execute(
+        "SELECT id, name FROM rooms ORDER BY id")]
+    pairs = _load_interference_pairs(conn)
+    mics = _load_mics(conn)
+    assignments = [{"mic_id": r["mic_id"], "freq": r["freq"]}
+                   for r in conn.execute(
+                       "SELECT mic_id, freq FROM assignments WHERE solution_id = ?",
+                       (sol_id,))]
+    return rooms, pairs, mics, assignments
+
+
+def _verification_json(conn, row, with_detail=True):
+    """序列化一条核验记录（含快照、上报区间与报告）。"""
+    snap = verification.loads(row["snapshot_json"])
+    entries = [dict(r) for r in conn.execute("""
+        SELECT mic_id, mic_name, start_min, end_min, freq
+        FROM verification_entries
+        WHERE verification_id = ?
+        ORDER BY start_min, end_min, id""", (row["id"],))]
+    report = None
+    if row["report_json"]:
+        report = json.loads(row["report_json"])
+    item = {
+        "id": row["id"],
+        "created_at": row["created_at"],
+        "solution_id": row["solution_id"],
+        "note": row["note"],
+        "revision": row["revision"],
+        "submitted": report is not None,
+        "entries": entries,
+    }
+    if with_detail:
+        item["snapshot"] = snap
+        item["report"] = report
+    return item
+
+
+@app.post("/api/verifications")
+def start_verification():
+    """从最新且未过期的方案开启一次现场执行核验，冻结方案与相关输入。"""
+    conn = db.get_db()
+    try:
+        sol_row = conn.execute(
+            "SELECT * FROM solutions ORDER BY id DESC LIMIT 1").fetchone()
+        if sol_row is None:
+            return jsonify(error="尚无编排方案，无法开启核验，请先执行编排"), 409
+        if sol_row["expired"] or sol_row["input_hash"] != _input_hash(conn):
+            return jsonify(
+                error="最新方案已过期（录入在编排后发生过变更），"
+                      "请重新编排后再开启核验"), 409
+
+        rooms, pairs, mics, assignments = _load_snapshot_inputs(conn, sol_row)
+        snap = verification.build_snapshot(rooms, pairs, mics, assignments)
+        data = request.get_json(silent=True) or {}
+        note = str(data.get("note") or "").strip() or None
+
+        cur = conn.execute(
+            "INSERT INTO verifications(created_at, solution_id, note,"
+            " revision, report_json) VALUES (?,?,?,1,NULL)",
+            (db.now_iso(), sol_row["id"], note))
+        vid = cur.lastrowid
+        conn.execute(
+            "INSERT INTO verification_snapshots(verification_id, payload_json)"
+            " VALUES (?,?)", (vid, verification.dumps(snap)))
+        conn.commit()
+        return jsonify(id=vid, solution_id=sol_row["id"], revision=1, ok=True)
+    finally:
+        conn.close()
+
+
+@app.get("/api/verifications")
+def list_verifications():
+    conn = db.get_db()
+    try:
+        rows = conn.execute("""
+            SELECT v.*, vs.payload_json AS snapshot_json
+            FROM verifications v
+            LEFT JOIN verification_snapshots vs
+                   ON vs.verification_id = v.id
+            ORDER BY v.id""").fetchall()
+        return jsonify(verifications=[_verification_json(conn, r) for r in rows])
+    finally:
+        conn.close()
+
+
+@app.get("/api/verifications/<int:vid>")
+def get_verification(vid):
+    conn = db.get_db()
+    try:
+        row = conn.execute("""
+            SELECT v.*, vs.payload_json AS snapshot_json
+            FROM verifications v
+            LEFT JOIN verification_snapshots vs
+                   ON vs.verification_id = v.id
+            WHERE v.id = ?""", (vid,)).fetchone()
+        if row is None:
+            return jsonify(error="核验记录不存在"), 404
+        return jsonify(_verification_json(conn, row))
+    finally:
+        conn.close()
+
+
+@app.put("/api/verifications/<int:vid>")
+def submit_verification(vid):
+    """携核验修订号提交完整替代区间集。旧修订号拒绝且不部分写入。"""
+    data = request.get_json(silent=True)
+    if data is None:
+        return jsonify(error="请求体必须为 JSON"), 400
+    conn = db.get_db()
+    try:
+        row = conn.execute("""
+            SELECT v.*, vs.payload_json AS snapshot_json
+            FROM verifications v
+            JOIN verification_snapshots vs ON vs.verification_id = v.id
+            WHERE v.id = ?""", (vid,)).fetchone()
+        if row is None:
+            return jsonify(error="核验记录不存在"), 404
+        snap = verification.loads(row["snapshot_json"])
+
+        try:
+            revision, entries = verification.validate_submission(data, snap)
+        except verification.RevisionMismatch as e:
+            return jsonify(error=str(e), current_revision=row["revision"]), 409
+        except verification.VerificationError as e:
+            return jsonify(error=str(e)), 400
+
+        if revision != row["revision"]:
+            return jsonify(
+                error=f"修订号 {revision} 已过期：核验 #{vid} 当前修订号为 "
+                      f"{row['revision']}，整份提交已拒绝（未写入任何区间）",
+                current_revision=row["revision"]), 409
+
+        report = verification.build_report(snap, entries)
+        # 全量替代：同一事务内先清空旧区间再写入，失败回滚不产生部分写入
+        conn.execute(
+            "DELETE FROM verification_entries WHERE verification_id = ?", (vid,))
+        conn.executemany("""
+            INSERT INTO verification_entries(verification_id, mic_id, mic_name,
+                                             start_min, end_min, freq)
+            VALUES (?,?,?,?,?,?)""",
+            [(vid, mic_id, mic_name, s, e, f)
+             for mic_id, mic_name, segs in entries
+             for s, e, f in segs])
+        conn.execute(
+            "UPDATE verifications SET revision = revision + 1, report_json = ?"
+            " WHERE id = ?", (json.dumps(report, ensure_ascii=False), vid))
+        conn.commit()
+        return jsonify(ok=True, id=vid, revision=revision + 1,
+                       counts=report["counts"])
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------- 演示 / 重置
 
 @app.post("/api/demo")
@@ -391,7 +563,9 @@ def load_demo():
 def reset_all():
     conn = db.get_db()
     try:
-        for table in ("assignments", "solutions", "mic_freqs",
+        for table in ("verification_entries", "verification_snapshots",
+                      "verifications",
+                      "assignments", "solutions", "mic_freqs",
                       "mics", "interference", "rooms"):
             conn.execute(f"DELETE FROM {table}")
         conn.commit()
